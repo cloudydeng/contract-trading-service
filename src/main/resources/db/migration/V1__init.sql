@@ -1,0 +1,10 @@
+CREATE TABLE IF NOT EXISTS orders (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    symbol VARCHAR(32) NOT NULL,
+    side VARCHAR(8) NOT NULL,
+    quantity NUMERIC(36, 18) NOT NULL,
+    price NUMERIC(36, 18) NOT NULL,
+    status VARCHAR(32) NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL
+);

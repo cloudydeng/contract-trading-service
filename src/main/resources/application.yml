@@ -1,0 +1,45 @@
+spring:
+  application:
+    name: contract-trading-service
+  datasource:
+    url: jdbc:postgresql://localhost:5432/contract_trading
+    username: postgres
+    password: postgres
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        format_sql: true
+    open-in-view: false
+  flyway:
+    enabled: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+
+matching:
+  shards: 4
+
+price:
+  mark-basis-limit-bps: 30
+  sample-interval-ms: 5000
+  settlement-window-seconds: 60
+
+outbox:
+  publish-interval-ms: 1000
+
+liquidation:
+  enabled: true
+  scan-interval-ms: 2000
+  trigger-loss-bps: 8000
+
+funding:
+  enabled: true
+  interval-hours: 8
+  max-rate-bps: 75
+  settle-delay-seconds: 10
+  scan-interval-ms: 10000
