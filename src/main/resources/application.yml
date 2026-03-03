@@ -23,6 +23,7 @@ management:
 
 matching:
   shards: 4
+  ring-buffer-size: 65536
 
 price:
   mark-basis-limit-bps: 30

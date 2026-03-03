@@ -1,5 +1,11 @@
 package com.matching.contract.engine;
 
+import com.lmax.disruptor.BlockingWaitStrategy;
+import com.lmax.disruptor.EventHandler;
+import com.lmax.disruptor.RingBuffer;
+import com.lmax.disruptor.TimeoutException;
+import com.lmax.disruptor.dsl.Disruptor;
+import com.lmax.disruptor.dsl.ProducerType;
 import com.matching.contract.entity.ExecutionLogEntity;
 import com.matching.contract.entity.LiquidityRole;
 import com.matching.contract.entity.OrderEntity;
@@ -25,9 +31,8 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
@@ -43,6 +48,7 @@ public class MatchingEngine {
     private final AsyncPersistenceService persistenceService;
     private final MarkPriceService markPriceService;
     private final int shardCount;
+    private final int ringBufferSize;
 
     private final List<ShardWorker> workers = new ArrayList<>();
 
@@ -51,13 +57,15 @@ public class MatchingEngine {
                           ExecutionLogRepository executionLogRepository,
                           AsyncPersistenceService persistenceService,
                           MarkPriceService markPriceService,
-                          @Value("${matching.shards:4}") int shardCount) {
+                          @Value("${matching.shards:4}") int shardCount,
+                          @Value("${matching.ring-buffer-size:65536}") int ringBufferSize) {
         this.positionService = positionService;
         this.orderRepository = orderRepository;
         this.executionLogRepository = executionLogRepository;
         this.persistenceService = persistenceService;
         this.markPriceService = markPriceService;
         this.shardCount = Math.max(1, shardCount);
+        this.ringBufferSize = toPowerOfTwo(Math.max(1024, ringBufferSize));
     }
 
     @PostConstruct
@@ -119,6 +127,14 @@ public class MatchingEngine {
         return workers.get(idx);
     }
 
+    private int toPowerOfTwo(int value) {
+        int n = 1;
+        while (n < value) {
+            n <<= 1;
+        }
+        return n;
+    }
+
     private <T> T await(CompletableFuture<T> future) {
         try {
             return future.get(3, TimeUnit.SECONDS);
@@ -127,35 +143,56 @@ public class MatchingEngine {
         }
     }
 
-    private final class ShardWorker implements Runnable {
+    private final class ShardWorker {
 
         private final int shardId;
-        private final LinkedBlockingQueue<Task> queue = new LinkedBlockingQueue<>();
-        private final AtomicBoolean running = new AtomicBoolean(false);
         private final Map<String, OrderBook> books = new HashMap<>();
         private final Map<Long, RestingOrder> restingOrderIndex = new HashMap<>();
         private final Map<String, Long> lastSequenceBySymbol = new HashMap<>();
-        private Thread thread;
+        private Disruptor<ShardEvent> disruptor;
+        private RingBuffer<ShardEvent> ringBuffer;
 
         private ShardWorker(int shardId) {
             this.shardId = shardId;
         }
 
         void start() {
-            running.set(true);
-            thread = new Thread(this, "matching-shard-" + shardId);
-            thread.start();
+            ThreadFactory threadFactory = runnable -> {
+                Thread thread = new Thread(runnable, "matching-shard-" + shardId);
+                thread.setDaemon(true);
+                return thread;
+            };
+            disruptor = new Disruptor<>(
+                    ShardEvent::new,
+                    ringBufferSize,
+                    threadFactory,
+                    ProducerType.MULTI,
+                    new BlockingWaitStrategy()
+            );
+            EventHandler<ShardEvent> handler = (event, sequence, endOfBatch) -> {
+                Task task = event.task;
+                if (task != null) {
+                    process(task);
+                    event.task = null;
+                }
+            };
+            disruptor.handleEventsWith(handler);
+            ringBuffer = disruptor.start();
         }
 
         void stop() {
-            running.set(false);
-            if (thread != null) {
-                thread.interrupt();
+            if (disruptor == null) {
+                return;
+            }
+            try {
+                disruptor.shutdown(5, TimeUnit.SECONDS);
+            } catch (TimeoutException ex) {
+                disruptor.halt();
             }
         }
 
         void submit(Task task) {
-            queue.offer(task);
+            ringBuffer.publishEvent((event, sequence, payload) -> event.task = payload, task);
         }
 
         void bootstrap(ExecutionLogEntity log) {
@@ -178,21 +215,6 @@ public class MatchingEngine {
             orderBook.add(restingOrder);
             restingOrderIndex.put(order.getId(), restingOrder);
             lastSequenceBySymbol.computeIfAbsent(order.getSymbol(), persistenceService::findLastSequence);
-        }
-
-        @Override
-        public void run() {
-            while (running.get() || !queue.isEmpty()) {
-                try {
-                    Task task = queue.poll(200, TimeUnit.MILLISECONDS);
-                    if (task == null) {
-                        continue;
-                    }
-                    process(task);
-                } catch (InterruptedException ignored) {
-                    Thread.currentThread().interrupt();
-                }
-            }
         }
 
         private void process(Task task) {
@@ -451,6 +473,10 @@ public class MatchingEngine {
             }
         }
         return null;
+    }
+
+    private static final class ShardEvent {
+        private Task task;
     }
 
     private static final class Task {
