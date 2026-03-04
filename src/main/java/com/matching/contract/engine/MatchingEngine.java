@@ -21,18 +21,16 @@ import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import java.math.BigDecimal;
 import java.util.ArrayDeque;
-import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.Deque;
 import java.util.EnumSet;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
@@ -47,84 +45,73 @@ public class MatchingEngine {
     private final ExecutionLogRepository executionLogRepository;
     private final AsyncPersistenceService persistenceService;
     private final MarkPriceService markPriceService;
-    private final int shardCount;
     private final int ringBufferSize;
 
-    private final List<ShardWorker> workers = new ArrayList<>();
+    private final Map<String, SymbolWorker> workers = new ConcurrentHashMap<>();
+    private final AtomicBoolean started = new AtomicBoolean(false);
 
     public MatchingEngine(PositionService positionService,
                           OrderRepository orderRepository,
                           ExecutionLogRepository executionLogRepository,
                           AsyncPersistenceService persistenceService,
                           MarkPriceService markPriceService,
-                          @Value("${matching.shards:4}") int shardCount,
                           @Value("${matching.ring-buffer-size:65536}") int ringBufferSize) {
         this.positionService = positionService;
         this.orderRepository = orderRepository;
         this.executionLogRepository = executionLogRepository;
         this.persistenceService = persistenceService;
         this.markPriceService = markPriceService;
-        this.shardCount = Math.max(1, shardCount);
         this.ringBufferSize = toPowerOfTwo(Math.max(1024, ringBufferSize));
     }
 
     @PostConstruct
     void start() {
-        for (int i = 0; i < shardCount; i++) {
-            workers.add(new ShardWorker(i));
-        }
-
-        // Full replay: rebuild in-memory books from execution_log ordered by symbol+seq.
         List<ExecutionLogEntity> logs = executionLogRepository.findAllByOrderBySymbolAscSequenceIdAsc();
         for (ExecutionLogEntity log : logs) {
-            route(log.getSymbol()).bootstrap(log);
+            getOrCreateWorker(log.getSymbol()).bootstrap(log);
         }
 
-        // Fallback for old data: replay open orders that are not in memory yet.
         List<OrderEntity> openOrders = orderRepository.findByStatusIn(EnumSet.of(OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED));
         for (OrderEntity order : openOrders) {
-            route(order.getSymbol()).bootstrapOrder(order);
+            getOrCreateWorker(order.getSymbol()).bootstrapOrder(order);
         }
 
-        for (ShardWorker worker : workers) {
-            worker.start();
-        }
+        started.set(true);
+        workers.values().forEach(SymbolWorker::start);
     }
 
     @PreDestroy
     void stop() {
-        for (ShardWorker worker : workers) {
-            worker.stop();
-        }
+        started.set(false);
+        workers.values().forEach(SymbolWorker::stop);
     }
 
     public OrderEntity submit(OrderEntity order) {
         CompletableFuture<OrderEntity> result = new CompletableFuture<>();
-        route(order.getSymbol()).submit(Task.place(order, result));
+        SymbolWorker worker = getOrCreateWorker(order.getSymbol());
+        worker.startIfNeeded(started.get());
+        worker.submit(Task.place(order, result));
         return await(result);
     }
 
     public void cancel(OrderEntity order) {
         CompletableFuture<Void> result = new CompletableFuture<>();
-        route(order.getSymbol()).submit(Task.cancel(order, result));
+        SymbolWorker worker = getOrCreateWorker(order.getSymbol());
+        worker.startIfNeeded(started.get());
+        worker.submit(Task.cancel(order, result));
         await(result);
     }
 
     public void reset() {
-        List<CompletableFuture<Void>> futures = new ArrayList<>();
-        for (ShardWorker worker : workers) {
+        for (SymbolWorker worker : workers.values()) {
             CompletableFuture<Void> future = new CompletableFuture<>();
-            futures.add(future);
             worker.submit(Task.reset(future));
-        }
-        for (CompletableFuture<Void> future : futures) {
             await(future);
         }
     }
 
-    private ShardWorker route(String symbol) {
-        int idx = Math.floorMod(symbol.hashCode(), shardCount);
-        return workers.get(idx);
+    private SymbolWorker getOrCreateWorker(String symbol) {
+        return workers.computeIfAbsent(symbol, SymbolWorker::new);
     }
 
     private int toPowerOfTwo(int value) {
@@ -143,33 +130,39 @@ public class MatchingEngine {
         }
     }
 
-    private final class ShardWorker {
+    private final class SymbolWorker {
 
-        private final int shardId;
-        private final Map<String, OrderBook> books = new HashMap<>();
-        private final Map<Long, RestingOrder> restingOrderIndex = new HashMap<>();
-        private final Map<String, Long> lastSequenceBySymbol = new HashMap<>();
-        private Disruptor<ShardEvent> disruptor;
-        private RingBuffer<ShardEvent> ringBuffer;
+        private final String symbol;
+        private final OrderBook orderBook = new OrderBook();
+        private final Map<Long, RestingOrder> restingOrderIndex = new ConcurrentHashMap<>();
 
-        private ShardWorker(int shardId) {
-            this.shardId = shardId;
+        private volatile long lastSequence = -1L;
+        private volatile boolean startedLocal = false;
+
+        private Disruptor<SymbolEvent> disruptor;
+        private RingBuffer<SymbolEvent> ringBuffer;
+
+        private SymbolWorker(String symbol) {
+            this.symbol = symbol;
         }
 
-        void start() {
+        synchronized void start() {
+            if (startedLocal) {
+                return;
+            }
             ThreadFactory threadFactory = runnable -> {
-                Thread thread = new Thread(runnable, "matching-shard-" + shardId);
+                Thread thread = new Thread(runnable, "matching-symbol-" + symbol);
                 thread.setDaemon(true);
                 return thread;
             };
             disruptor = new Disruptor<>(
-                    ShardEvent::new,
+                    SymbolEvent::new,
                     ringBufferSize,
                     threadFactory,
                     ProducerType.MULTI,
                     new BlockingWaitStrategy()
             );
-            EventHandler<ShardEvent> handler = (event, sequence, endOfBatch) -> {
+            EventHandler<SymbolEvent> handler = (event, sequence, endOfBatch) -> {
                 Task task = event.task;
                 if (task != null) {
                     process(task);
@@ -178,10 +171,17 @@ public class MatchingEngine {
             };
             disruptor.handleEventsWith(handler);
             ringBuffer = disruptor.start();
+            startedLocal = true;
         }
 
-        void stop() {
-            if (disruptor == null) {
+        synchronized void startIfNeeded(boolean globalStarted) {
+            if (globalStarted) {
+                start();
+            }
+        }
+
+        synchronized void stop() {
+            if (!startedLocal || disruptor == null) {
                 return;
             }
             try {
@@ -189,9 +189,13 @@ public class MatchingEngine {
             } catch (TimeoutException ex) {
                 disruptor.halt();
             }
+            startedLocal = false;
         }
 
         void submit(Task task) {
+            if (!startedLocal || ringBuffer == null) {
+                throw new IllegalStateException("symbol worker not started: " + symbol);
+            }
             ringBuffer.publishEvent((event, sequence, payload) -> event.task = payload, task);
         }
 
@@ -210,11 +214,12 @@ public class MatchingEngine {
             if (order.getOrderType() != OrderType.LIMIT || order.getTimeInForce() != TimeInForce.GTC) {
                 return;
             }
-            OrderBook orderBook = books.computeIfAbsent(order.getSymbol(), key -> new OrderBook());
             RestingOrder restingOrder = RestingOrder.from(order, remaining);
             orderBook.add(restingOrder);
             restingOrderIndex.put(order.getId(), restingOrder);
-            lastSequenceBySymbol.computeIfAbsent(order.getSymbol(), persistenceService::findLastSequence);
+            if (lastSequence < 0) {
+                lastSequence = persistenceService.findLastSequence(symbol);
+            }
         }
 
         private void process(Task task) {
@@ -226,9 +231,9 @@ public class MatchingEngine {
                         task.voidResult.complete(null);
                     }
                     case RESET -> {
-                        books.clear();
+                        orderBook.clear();
                         restingOrderIndex.clear();
-                        lastSequenceBySymbol.clear();
+                        lastSequence = -1L;
                         task.voidResult.complete(null);
                     }
                 }
@@ -243,19 +248,18 @@ public class MatchingEngine {
         }
 
         private OrderEntity place(OrderEntity order) {
-            ensureSequenceInitialized(order.getSymbol());
-            OrderBook orderBook = books.computeIfAbsent(order.getSymbol(), key -> new OrderBook());
+            ensureSequenceInitialized();
             BigDecimal remaining = order.getQuantity().subtract(order.getFilledQuantity());
             if (remaining.compareTo(BigDecimal.ZERO) <= 0) {
                 return order;
             }
 
-            recordEvent(order.getSymbol(), "ORDER_RECEIVED", payload(order), "order.received", payload(order));
+            recordEvent("ORDER_RECEIVED", payload(order), "order.received", payload(order));
 
-            if (order.getTimeInForce() == TimeInForce.FOK && !canFullyFill(orderBook, order, remaining)) {
+            if (order.getTimeInForce() == TimeInForce.FOK && !canFullyFill(order, remaining)) {
                 order.setStatus(OrderStatus.CANCELED);
                 OrderEntity saved = orderRepository.save(order);
-                recordEvent(order.getSymbol(), "ORDER_CANCELED", payload(saved), "order.canceled", payload(saved));
+                recordEvent("ORDER_CANCELED", payload(saved), "order.canceled", payload(saved));
                 return saved;
             }
 
@@ -293,7 +297,7 @@ public class MatchingEngine {
 
                 String tradePayload = "takerOrderId=" + order.getId() + ",makerOrderId=" + maker.orderId()
                         + ",qty=" + fillQty + ",price=" + fillPrice;
-                recordEvent(order.getSymbol(), "TRADE_EXECUTED", tradePayload, "trade.executed", tradePayload);
+                recordEvent("TRADE_EXECUTED", tradePayload, "trade.executed", tradePayload);
                 markPriceService.updateLastTradePrice(order.getSymbol(), fillPrice);
 
                 remaining = remaining.subtract(fillQty);
@@ -308,7 +312,7 @@ public class MatchingEngine {
                 makerOrder.setFilledQuantity(makerOrder.getFilledQuantity().add(fillQty));
                 makerOrder.setStatus(resolveStatus(makerOrder));
                 makerOrder = orderRepository.save(makerOrder);
-                recordEvent(makerOrder.getSymbol(), "ORDER_UPDATED", payload(makerOrder), "order.updated", payload(makerOrder));
+                recordEvent("ORDER_UPDATED", payload(makerOrder), "order.updated", payload(makerOrder));
 
                 maker.consume(fillQty);
                 if (maker.remainingQuantity().compareTo(BigDecimal.ZERO) == 0) {
@@ -332,7 +336,7 @@ public class MatchingEngine {
             }
 
             OrderEntity saved = orderRepository.save(order);
-            recordEvent(order.getSymbol(), "ORDER_UPDATED", payload(saved), "order.updated", payload(saved));
+            recordEvent("ORDER_UPDATED", payload(saved), "order.updated", payload(saved));
             return saved;
         }
 
@@ -341,30 +345,29 @@ public class MatchingEngine {
             if (restingOrder == null) {
                 return;
             }
-            OrderBook book = books.get(restingOrder.symbol());
-            if (book != null) {
-                book.remove(restingOrder);
-            }
-            recordEvent(order.getSymbol(), "ORDER_CANCELED", payload(order), "order.canceled", payload(order));
+            orderBook.remove(restingOrder);
+            recordEvent("ORDER_CANCELED", payload(order), "order.canceled", payload(order));
         }
 
         private void applyReplayLog(ExecutionLogEntity log) {
-            String symbol = log.getSymbol();
-            long last = lastSequenceBySymbol.getOrDefault(symbol, 0L);
+            if (!symbol.equals(log.getSymbol())) {
+                return;
+            }
+
+            long last = Math.max(0L, lastSequence);
             if (log.getSequenceId() <= last) {
                 return;
             }
-            if (log.getSequenceId() != last + 1) {
+            if (last > 0 && log.getSequenceId() != last + 1) {
                 throw new IllegalStateException("execution_log sequence gap for symbol=" + symbol
                         + ", expected=" + (last + 1) + ", actual=" + log.getSequenceId());
             }
-            lastSequenceBySymbol.put(symbol, log.getSequenceId());
+            lastSequence = log.getSequenceId();
 
             switch (log.getEventType()) {
                 case "ORDER_UPDATED" -> applyOrderSnapshot(log.getPayload());
                 case "ORDER_CANCELED" -> removeOrderFromBook(parseLong(log.getPayload(), "orderId"));
                 default -> {
-                    // ORDER_RECEIVED / TRADE_EXECUTED only move checkpoint.
                 }
             }
         }
@@ -378,7 +381,6 @@ public class MatchingEngine {
                 return;
             }
 
-            OrderBook orderBook = books.computeIfAbsent(snapshot.symbol, key -> new OrderBook());
             RestingOrder restingOrder = snapshot.toRestingOrder(orderId);
             orderBook.add(restingOrder);
             restingOrderIndex.put(orderId, restingOrder);
@@ -389,18 +391,14 @@ public class MatchingEngine {
                 return;
             }
             RestingOrder existing = restingOrderIndex.remove(orderId);
-            if (existing == null) {
-                return;
-            }
-            OrderBook book = books.get(existing.symbol());
-            if (book != null) {
-                book.remove(existing);
+            if (existing != null) {
+                orderBook.remove(existing);
             }
         }
 
-        private boolean canFullyFill(OrderBook book, OrderEntity order, BigDecimal remaining) {
+        private boolean canFullyFill(OrderEntity order, BigDecimal remaining) {
             BigDecimal executable = BigDecimal.ZERO;
-            for (RestingOrder resting : book.iterateOpposite(order.getSide())) {
+            for (RestingOrder resting : orderBook.iterateOpposite(order.getSide())) {
                 if (!isMatchable(order, resting.price())) {
                     break;
                 }
@@ -432,12 +430,14 @@ public class MatchingEngine {
             return OrderStatus.PARTIALLY_FILLED;
         }
 
-        private void ensureSequenceInitialized(String symbol) {
-            lastSequenceBySymbol.computeIfAbsent(symbol, persistenceService::findLastSequence);
+        private void ensureSequenceInitialized() {
+            if (lastSequence < 0) {
+                lastSequence = persistenceService.findLastSequence(symbol);
+            }
         }
 
-        private void recordEvent(String symbol, String eventType, String executionPayload, String outboxTopic, String outboxPayload) {
-            long sequence = lastSequenceBySymbol.compute(symbol, (key, old) -> old == null ? 1L : old + 1L);
+        private void recordEvent(String eventType, String executionPayload, String outboxTopic, String outboxPayload) {
+            long sequence = (++lastSequence);
             String eventId = symbol + "-" + sequence;
             persistenceService.appendExecution(symbol, sequence, eventId, eventType, executionPayload);
             persistenceService.appendOutbox(eventId, outboxTopic, outboxPayload);
@@ -475,7 +475,7 @@ public class MatchingEngine {
         return null;
     }
 
-    private static final class ShardEvent {
+    private static final class SymbolEvent {
         private Task task;
     }
 
@@ -516,8 +516,8 @@ public class MatchingEngine {
 
     private static final class OrderBook {
 
-        private final TreeMap<BigDecimal, Deque<RestingOrder>> bids = new TreeMap<>(Comparator.reverseOrder());
-        private final TreeMap<BigDecimal, Deque<RestingOrder>> asks = new TreeMap<>();
+        private final TreeMap<BigDecimal, ArrayDeque<RestingOrder>> bids = new TreeMap<>(java.util.Comparator.reverseOrder());
+        private final TreeMap<BigDecimal, ArrayDeque<RestingOrder>> asks = new TreeMap<>();
 
         RestingOrder bestOpposite(String takerSide) {
             if ("BUY".equalsIgnoreCase(takerSide)) {
@@ -531,14 +531,12 @@ public class MatchingEngine {
         }
 
         void add(RestingOrder order) {
-            levelsForSide(order.side())
-                    .computeIfAbsent(order.price(), key -> new ArrayDeque<>())
-                    .addLast(order);
+            levelsForSide(order.side()).computeIfAbsent(order.price(), key -> new ArrayDeque<>()).addLast(order);
         }
 
         void remove(RestingOrder order) {
-            TreeMap<BigDecimal, Deque<RestingOrder>> levels = levelsForSide(order.side());
-            Deque<RestingOrder> queue = levels.get(order.price());
+            TreeMap<BigDecimal, ArrayDeque<RestingOrder>> levels = levelsForSide(order.side());
+            ArrayDeque<RestingOrder> queue = levels.get(order.price());
             if (queue == null) {
                 return;
             }
@@ -549,8 +547,8 @@ public class MatchingEngine {
         }
 
         void removeHead(RestingOrder order) {
-            TreeMap<BigDecimal, Deque<RestingOrder>> levels = levelsForSide(order.side());
-            Deque<RestingOrder> queue = levels.get(order.price());
+            TreeMap<BigDecimal, ArrayDeque<RestingOrder>> levels = levelsForSide(order.side());
+            ArrayDeque<RestingOrder> queue = levels.get(order.price());
             if (queue == null) {
                 return;
             }
@@ -563,23 +561,28 @@ public class MatchingEngine {
             }
         }
 
-        private RestingOrder head(TreeMap<BigDecimal, Deque<RestingOrder>> levels) {
-            Map.Entry<BigDecimal, Deque<RestingOrder>> best = levels.firstEntry();
+        void clear() {
+            bids.clear();
+            asks.clear();
+        }
+
+        private RestingOrder head(TreeMap<BigDecimal, ArrayDeque<RestingOrder>> levels) {
+            Map.Entry<BigDecimal, ArrayDeque<RestingOrder>> best = levels.firstEntry();
             if (best == null || best.getValue().isEmpty()) {
                 return null;
             }
             return best.getValue().peekFirst();
         }
 
-        private Iterable<RestingOrder> flatten(TreeMap<BigDecimal, Deque<RestingOrder>> levels) {
-            Deque<RestingOrder> result = new ArrayDeque<>();
-            for (Deque<RestingOrder> queue : levels.values()) {
+        private Iterable<RestingOrder> flatten(TreeMap<BigDecimal, ArrayDeque<RestingOrder>> levels) {
+            ArrayDeque<RestingOrder> result = new ArrayDeque<>();
+            for (ArrayDeque<RestingOrder> queue : levels.values()) {
                 result.addAll(queue);
             }
             return result;
         }
 
-        private TreeMap<BigDecimal, Deque<RestingOrder>> levelsForSide(String side) {
+        private TreeMap<BigDecimal, ArrayDeque<RestingOrder>> levelsForSide(String side) {
             return "BUY".equalsIgnoreCase(side) ? bids : asks;
         }
     }
