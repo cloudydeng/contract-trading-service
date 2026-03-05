@@ -22,8 +22,8 @@ management:
         include: health,info,metrics
 
 matching:
-  shards: 4
   ring-buffer-size: 65536
+  max-symbol-workers: 256
 
 price:
   mark-basis-limit-bps: 30

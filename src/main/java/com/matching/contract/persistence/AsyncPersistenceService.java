@@ -48,7 +48,19 @@ public class AsyncPersistenceService {
     void stop() {
         running.set(false);
         if (worker != null) {
-            worker.interrupt();
+            try {
+                worker.join(5000);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+            if (worker.isAlive()) {
+                worker.interrupt();
+                try {
+                    worker.join(2000);
+                } catch (InterruptedException ignored) {
+                    Thread.currentThread().interrupt();
+                }
+            }
         }
     }
 
@@ -86,7 +98,7 @@ public class AsyncPersistenceService {
                 queue.drainTo(batch, BATCH_SIZE - 1);
                 flush(batch);
             } catch (InterruptedException ignored) {
-                Thread.currentThread().interrupt();
+                // continue draining remaining events on shutdown
             } catch (Exception ex) {
                 // Retry once by re-enqueueing; durability over latency in failure path.
                 for (PersistTask task : batch) {

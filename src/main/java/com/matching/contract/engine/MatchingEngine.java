@@ -20,6 +20,7 @@ import com.matching.contract.service.PositionService;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import java.math.BigDecimal;
+import java.util.ArrayList;
 import java.util.ArrayDeque;
 import java.util.EnumSet;
 import java.util.List;
@@ -33,6 +34,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 
 @Component
 public class MatchingEngine {
@@ -46,6 +49,8 @@ public class MatchingEngine {
     private final AsyncPersistenceService persistenceService;
     private final MarkPriceService markPriceService;
     private final int ringBufferSize;
+    private final int maxSymbolWorkers;
+    private final TransactionTemplate transactionTemplate;
 
     private final Map<String, SymbolWorker> workers = new ConcurrentHashMap<>();
     private final AtomicBoolean started = new AtomicBoolean(false);
@@ -55,13 +60,17 @@ public class MatchingEngine {
                           ExecutionLogRepository executionLogRepository,
                           AsyncPersistenceService persistenceService,
                           MarkPriceService markPriceService,
-                          @Value("${matching.ring-buffer-size:65536}") int ringBufferSize) {
+                          PlatformTransactionManager transactionManager,
+                          @Value("${matching.ring-buffer-size:65536}") int ringBufferSize,
+                          @Value("${matching.max-symbol-workers:256}") int maxSymbolWorkers) {
         this.positionService = positionService;
         this.orderRepository = orderRepository;
         this.executionLogRepository = executionLogRepository;
         this.persistenceService = persistenceService;
         this.markPriceService = markPriceService;
         this.ringBufferSize = toPowerOfTwo(Math.max(1024, ringBufferSize));
+        this.maxSymbolWorkers = Math.max(1, maxSymbolWorkers);
+        this.transactionTemplate = new TransactionTemplate(transactionManager);
     }
 
     @PostConstruct
@@ -94,12 +103,12 @@ public class MatchingEngine {
         return await(result);
     }
 
-    public void cancel(OrderEntity order) {
-        CompletableFuture<Void> result = new CompletableFuture<>();
+    public OrderEntity cancel(OrderEntity order) {
+        CompletableFuture<OrderEntity> result = new CompletableFuture<>();
         SymbolWorker worker = getOrCreateWorker(order.getSymbol());
         worker.startIfNeeded(started.get());
         worker.submit(Task.cancel(order, result));
-        await(result);
+        return await(result);
     }
 
     public void reset() {
@@ -110,8 +119,17 @@ public class MatchingEngine {
         }
     }
 
-    private SymbolWorker getOrCreateWorker(String symbol) {
-        return workers.computeIfAbsent(symbol, SymbolWorker::new);
+    private synchronized SymbolWorker getOrCreateWorker(String symbol) {
+        SymbolWorker existing = workers.get(symbol);
+        if (existing != null) {
+            return existing;
+        }
+        if (workers.size() >= maxSymbolWorkers) {
+            throw new IllegalStateException("too many active symbol workers: " + workers.size());
+        }
+        SymbolWorker created = new SymbolWorker(symbol);
+        workers.put(symbol, created);
+        return created;
     }
 
     private int toPowerOfTwo(int value) {
@@ -223,12 +241,18 @@ public class MatchingEngine {
         }
 
         private void process(Task task) {
+            SymbolState snapshot = snapshotState();
             try {
                 switch (task.type) {
-                    case PLACE -> task.placeResult.complete(place(task.order));
+                    case PLACE -> {
+                        TaskOutcome outcome = transactionTemplate.execute(status -> place(task.order));
+                        applyOutcome(outcome);
+                        task.orderResult.complete(outcome.savedOrder);
+                    }
                     case CANCEL -> {
-                        cancelInternal(task.order);
-                        task.voidResult.complete(null);
+                        TaskOutcome outcome = transactionTemplate.execute(status -> cancelInternal(task.order));
+                        applyOutcome(outcome);
+                        task.orderResult.complete(outcome.savedOrder);
                     }
                     case RESET -> {
                         orderBook.clear();
@@ -238,29 +262,30 @@ public class MatchingEngine {
                     }
                 }
             } catch (Exception ex) {
-                if (task.placeResult != null) {
-                    task.placeResult.completeExceptionally(ex);
+                if (task.orderResult != null) {
+                    task.orderResult.completeExceptionally(ex);
                 }
                 if (task.voidResult != null) {
                     task.voidResult.completeExceptionally(ex);
                 }
+                restoreState(snapshot);
             }
         }
 
-        private OrderEntity place(OrderEntity order) {
-            ensureSequenceInitialized();
+        private TaskOutcome place(OrderEntity order) {
+            EventCollector events = new EventCollector(symbol, ensureSequenceInitialized());
             BigDecimal remaining = order.getQuantity().subtract(order.getFilledQuantity());
             if (remaining.compareTo(BigDecimal.ZERO) <= 0) {
-                return order;
+                return TaskOutcome.of(order, events);
             }
 
-            recordEvent("ORDER_RECEIVED", payload(order), "order.received", payload(order));
+            events.record("ORDER_RECEIVED", payload(order), "order.received", payload(order));
 
             if (order.getTimeInForce() == TimeInForce.FOK && !canFullyFill(order, remaining)) {
                 order.setStatus(OrderStatus.CANCELED);
                 OrderEntity saved = orderRepository.save(order);
-                recordEvent("ORDER_CANCELED", payload(saved), "order.canceled", payload(saved));
-                return saved;
+                events.record("ORDER_CANCELED", payload(saved), "order.canceled", payload(saved));
+                return TaskOutcome.of(saved, events);
             }
 
             while (remaining.compareTo(BigDecimal.ZERO) > 0) {
@@ -297,8 +322,8 @@ public class MatchingEngine {
 
                 String tradePayload = "takerOrderId=" + order.getId() + ",makerOrderId=" + maker.orderId()
                         + ",qty=" + fillQty + ",price=" + fillPrice;
-                recordEvent("TRADE_EXECUTED", tradePayload, "trade.executed", tradePayload);
-                markPriceService.updateLastTradePrice(order.getSymbol(), fillPrice);
+                events.record("TRADE_EXECUTED", tradePayload, "trade.executed", tradePayload);
+                events.tradePrice(fillPrice);
 
                 remaining = remaining.subtract(fillQty);
                 order.setFilledQuantity(order.getFilledQuantity().add(fillQty));
@@ -312,7 +337,7 @@ public class MatchingEngine {
                 makerOrder.setFilledQuantity(makerOrder.getFilledQuantity().add(fillQty));
                 makerOrder.setStatus(resolveStatus(makerOrder));
                 makerOrder = orderRepository.save(makerOrder);
-                recordEvent("ORDER_UPDATED", payload(makerOrder), "order.updated", payload(makerOrder));
+                events.record("ORDER_UPDATED", payload(makerOrder), "order.updated", payload(makerOrder));
 
                 maker.consume(fillQty);
                 if (maker.remainingQuantity().compareTo(BigDecimal.ZERO) == 0) {
@@ -336,17 +361,22 @@ public class MatchingEngine {
             }
 
             OrderEntity saved = orderRepository.save(order);
-            recordEvent("ORDER_UPDATED", payload(saved), "order.updated", payload(saved));
-            return saved;
+            events.record("ORDER_UPDATED", payload(saved), "order.updated", payload(saved));
+            return TaskOutcome.of(saved, events);
         }
 
-        private void cancelInternal(OrderEntity order) {
-            RestingOrder restingOrder = restingOrderIndex.remove(order.getId());
+        private TaskOutcome cancelInternal(OrderEntity order) {
+            EventCollector events = new EventCollector(symbol, ensureSequenceInitialized());
+            OrderEntity current = orderRepository.findById(order.getId()).orElse(order);
+            RestingOrder restingOrder = restingOrderIndex.remove(current.getId());
             if (restingOrder == null) {
-                return;
+                return TaskOutcome.of(current, events);
             }
             orderBook.remove(restingOrder);
-            recordEvent("ORDER_CANCELED", payload(order), "order.canceled", payload(order));
+            current.setStatus(OrderStatus.CANCELED);
+            OrderEntity saved = orderRepository.save(current);
+            events.record("ORDER_CANCELED", payload(saved), "order.canceled", payload(saved));
+            return TaskOutcome.of(saved, events);
         }
 
         private void applyReplayLog(ExecutionLogEntity log) {
@@ -430,18 +460,39 @@ public class MatchingEngine {
             return OrderStatus.PARTIALLY_FILLED;
         }
 
-        private void ensureSequenceInitialized() {
+        private long ensureSequenceInitialized() {
             if (lastSequence < 0) {
                 lastSequence = persistenceService.findLastSequence(symbol);
             }
+            return lastSequence;
         }
 
-        private void recordEvent(String eventType, String executionPayload, String outboxTopic, String outboxPayload) {
-            long sequence = (++lastSequence);
-            String eventId = symbol + "-" + sequence;
-            persistenceService.appendExecution(symbol, sequence, eventId, eventType, executionPayload);
-            persistenceService.appendOutbox(eventId, outboxTopic, outboxPayload);
-            persistenceService.appendWal(symbol, eventType, executionPayload);
+        private void applyOutcome(TaskOutcome outcome) {
+            for (PendingEvent event : outcome.events.events) {
+                persistenceService.appendExecution(symbol, event.sequence, event.eventId, event.eventType, event.executionPayload);
+                persistenceService.appendOutbox(event.eventId, event.outboxTopic, event.outboxPayload);
+                persistenceService.appendWal(symbol, event.eventType, event.executionPayload);
+            }
+            for (BigDecimal price : outcome.events.tradePrices) {
+                markPriceService.updateLastTradePrice(symbol, price);
+            }
+            lastSequence = outcome.events.sequenceCursor;
+        }
+
+        private SymbolState snapshotState() {
+            List<RestingOrder> snapshotOrders = orderBook.snapshotOrders();
+            return new SymbolState(snapshotOrders, lastSequence);
+        }
+
+        private void restoreState(SymbolState snapshot) {
+            orderBook.clear();
+            restingOrderIndex.clear();
+            for (RestingOrder order : snapshot.orders) {
+                RestingOrder copy = order.copy();
+                orderBook.add(copy);
+                restingOrderIndex.put(copy.orderId(), copy);
+            }
+            lastSequence = snapshot.lastSequence;
         }
     }
 
@@ -482,16 +533,16 @@ public class MatchingEngine {
     private static final class Task {
         private final TaskType type;
         private final OrderEntity order;
-        private final CompletableFuture<OrderEntity> placeResult;
+        private final CompletableFuture<OrderEntity> orderResult;
         private final CompletableFuture<Void> voidResult;
 
         private Task(TaskType type,
                      OrderEntity order,
-                     CompletableFuture<OrderEntity> placeResult,
+                     CompletableFuture<OrderEntity> orderResult,
                      CompletableFuture<Void> voidResult) {
             this.type = type;
             this.order = order;
-            this.placeResult = placeResult;
+            this.orderResult = orderResult;
             this.voidResult = voidResult;
         }
 
@@ -499,8 +550,8 @@ public class MatchingEngine {
             return new Task(TaskType.PLACE, order, result, null);
         }
 
-        static Task cancel(OrderEntity order, CompletableFuture<Void> result) {
-            return new Task(TaskType.CANCEL, order, null, result);
+        static Task cancel(OrderEntity order, CompletableFuture<OrderEntity> result) {
+            return new Task(TaskType.CANCEL, order, result, null);
         }
 
         static Task reset(CompletableFuture<Void> result) {
@@ -512,6 +563,75 @@ public class MatchingEngine {
         PLACE,
         CANCEL,
         RESET
+    }
+
+    private static final class SymbolState {
+        private final List<RestingOrder> orders;
+        private final long lastSequence;
+
+        private SymbolState(List<RestingOrder> orders, long lastSequence) {
+            this.orders = orders;
+            this.lastSequence = lastSequence;
+        }
+    }
+
+    private static final class PendingEvent {
+        private final long sequence;
+        private final String eventId;
+        private final String eventType;
+        private final String executionPayload;
+        private final String outboxTopic;
+        private final String outboxPayload;
+
+        private PendingEvent(long sequence,
+                             String eventId,
+                             String eventType,
+                             String executionPayload,
+                             String outboxTopic,
+                             String outboxPayload) {
+            this.sequence = sequence;
+            this.eventId = eventId;
+            this.eventType = eventType;
+            this.executionPayload = executionPayload;
+            this.outboxTopic = outboxTopic;
+            this.outboxPayload = outboxPayload;
+        }
+    }
+
+    private static final class EventCollector {
+        private final String symbol;
+        private long sequenceCursor;
+        private final List<PendingEvent> events = new ArrayList<>();
+        private final List<BigDecimal> tradePrices = new ArrayList<>();
+
+        private EventCollector(String symbol, long sequenceCursor) {
+            this.symbol = symbol;
+            this.sequenceCursor = sequenceCursor;
+        }
+
+        void record(String eventType, String executionPayload, String outboxTopic, String outboxPayload) {
+            long sequence = ++sequenceCursor;
+            String eventId = symbol + "-" + sequence;
+            events.add(new PendingEvent(sequence, eventId, eventType, executionPayload, outboxTopic, outboxPayload));
+        }
+
+        void tradePrice(BigDecimal price) {
+            tradePrices.add(price);
+        }
+    }
+
+    private static final class TaskOutcome {
+        private final OrderEntity savedOrder;
+        private final EventCollector events;
+
+        private TaskOutcome(OrderEntity savedOrder, EventCollector events) {
+            this.savedOrder = savedOrder;
+            this.events = events;
+        }
+
+        private static TaskOutcome of(OrderEntity savedOrder, EventCollector events) {
+            return new TaskOutcome(savedOrder, events);
+        }
     }
 
     private static final class OrderBook {
@@ -564,6 +684,21 @@ public class MatchingEngine {
         void clear() {
             bids.clear();
             asks.clear();
+        }
+
+        List<RestingOrder> snapshotOrders() {
+            List<RestingOrder> snapshot = new ArrayList<>();
+            for (ArrayDeque<RestingOrder> queue : bids.values()) {
+                for (RestingOrder order : queue) {
+                    snapshot.add(order.copy());
+                }
+            }
+            for (ArrayDeque<RestingOrder> queue : asks.values()) {
+                for (RestingOrder order : queue) {
+                    snapshot.add(order.copy());
+                }
+            }
+            return snapshot;
         }
 
         private RestingOrder head(TreeMap<BigDecimal, ArrayDeque<RestingOrder>> levels) {
@@ -719,6 +854,10 @@ public class MatchingEngine {
 
         void consume(BigDecimal quantity) {
             this.remainingQuantity = this.remainingQuantity.subtract(quantity);
+        }
+
+        RestingOrder copy() {
+            return new RestingOrder(orderId, userId, symbol, side, price, remainingQuantity, reduceOnly);
         }
     }
 }

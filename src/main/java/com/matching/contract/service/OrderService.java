@@ -65,11 +65,12 @@ public class OrderService {
             throw new ConflictException("order cannot be canceled in status " + order.getStatus());
         }
 
-        order.setStatus(OrderStatus.CANCELED);
-        OrderEntity saved = orderRepository.save(order);
-        matchingEngine.cancel(saved);
-        ledgerService.releaseMargin(saved);
-        return OrderResponse.from(saved);
+        OrderEntity canceled = matchingEngine.cancel(order);
+        if (canceled.getStatus() != OrderStatus.CANCELED) {
+            throw new ConflictException("order cannot be canceled in status " + canceled.getStatus());
+        }
+        ledgerService.releaseMargin(canceled);
+        return OrderResponse.from(canceled);
     }
 
     private OrderEntity findById(Long orderId) {
